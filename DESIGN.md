@@ -1,173 +1,233 @@
-# VoiceTest — design for end-to-end testing of voice agents
+# VoiceTest — UAT for voice agents
 
-VoiceTest calls a voice agent the way a real customer would, over a phone number, SIP or
-WebRTC. A simulated caller holds the conversation, VoiceTest records both sides, and then it
-scores the call against assertions. You get pytest for phone bots: write the scenarios in
-YAML, run them in CI, and read a report with audio, a transcript and pass/fail results.
+**VoiceTest is a tool for developers who build voice agents. They use it to run user
+acceptance tests (UAT) on their agents before release.** It phones the agent in its UAT
+environment the way a real customer would. A simulated caller holds the conversation,
+VoiceTest records both sides, and then it checks the call against acceptance criteria,
+including whether the right thing actually happened in the UAT backend.
 
 ```
-voicetest run tests/ --target tel:+4930123456 --trials 5 --concurrency 4
+voicetest run tests/ --env uat --trials 5
 ```
+
+---
+
+## 0. Who uses it and how
+
+| Who | What they do |
+|---|---|
+| **Voice-agent developer** | Writes scenarios in the repo next to the agent's code. Runs them locally against UAT and debugs failures from the recording, the transcript and the timings. |
+| **QA / product owner** | Reads scenarios written in plain language, reviews the acceptance report, signs off a release or rejects it. |
+| **CI pipeline** | Runs the suite after each deploy to UAT. A non-zero exit code blocks promotion to production. |
+
+**Product decisions that follow from this:**
+
+- **An open-source CLI that runs where the developer runs it, with the developer's own API
+  keys** (Twilio, STT, TTS, Anthropic). There is no hosted service and no multi-tenancy in
+  the first versions. Recordings stay on the developer's infrastructure.
+- **It works with any agent, whatever it is built on.** A phone number is the universal
+  interface, so PSTN is the primary transport. Adapters for specific platforms come later as
+  a cheaper, faster option.
+- **The developer owns the agent and the UAT backend.** That makes checks on real results and
+  test-data setup and teardown first-class features.
+- **Scenarios and reports must be readable by non-developers**, because UAT is a sign-off
+  step.
 
 ---
 
 ## 1. How one test run works
 
 ```
- ┌──────────────┐  scenario.yaml   ┌───────────────────────────────────────────┐
- │  Test Runner │ ───────────────▶ │            Call Session (1 per call)      │
- │ (CLI / CI)   │                  │                                           │
- └──────┬───────┘                  │  ┌─────────┐   audio   ┌───────────────┐  │
-        │                          │  │Transport│◀────────▶│ Caller Agent  │  │
-        │                          │  │ adapter │           │ STT→LLM→TTS   │  │
-        │                          │  └────┬────┘           │ + VAD/turns   │  │
-        │                          │       │                └───────┬───────┘  │
-        │                          │       ▼                        │          │
-        │                          │  ┌──────────────────────────────▼──────┐   │
-        │                          │  │ Recorder: stereo WAV, timestamped   │   │
-        │                          │  │ events, per-turn transcript         │   │
-        │                          │  └──────────────────┬──────────────────┘   │
-        │                          └─────────────────────┼──────────────────────┘
-        │                                                ▼
-        │                          ┌───────────────────────────────────────────┐
-        └────────── results ◀──────│ Evaluators: metrics · rules · LLM judge · │
-                                   │ side-effect checks (webhook/DB/API)       │
-                                   └───────────────────────────────────────────┘
+ setup hook ──▶ create test data in the UAT backend (e.g. a customer with an appointment)
+      │
+      ▼
+ ┌──────────────────────────── Call session ─────────────────────────────┐
+ │ Transport (Twilio) ◀──full-duplex audio──▶ Caller agent              │
+ │                                             VAD + turn detect         │
+ │                                             STT → LLM → TTS           │
+ │                                             end_call() tool           │
+ │ Recorder: stereo WAV · events.jsonl · transcript · Twilio call SID    │
+ └───────────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+ Evaluators: timing · rules · AI judge · checks of results in the backend
+      │
+      ▼
+ teardown hook ──▶ clean up test data      Report: JUnit · JSON · HTML
 ```
-
-1. The runner loads a scenario and opens a **call session**.
-2. A **transport adapter** places the call and turns the audio into a bidirectional PCM
-   stream.
-3. The **caller agent** listens to the voice agent, decides what to say from its persona and
-   goal, and speaks.
-4. The **recorder** captures both channels on one clock. Every timing metric is measured from
-   that clock.
-5. When the call ends (hang-up, goal reached, time limit or stuck loop), the **evaluators**
-   score it and the runner writes the reports.
 
 ---
 
 ## 2. Components
 
-### 2.1 Transport adapters (how the call is reached)
+### 2.1 Transport
 
-| Adapter | Use case | Notes |
-|---|---|---|
-| `twilio` / `telnyx` / `vonage` | Real PSTN number | Outbound call with Media Streams (WebSocket, 8 kHz μ-law). This is the most realistic option because it includes carrier codec, jitter and latency. It needs a public webhook URL. |
-| `sip` | Agent behind a SIP trunk / PBX | Use LiveKit SIP, FreeSWITCH or a pjsua2 client. It avoids PSTN cost. |
-| `webrtc` / `livekit` | Agent built on LiveKit, Daily, Pipecat | Join the room as a participant. |
-| `websocket` | Vapi, Retell, ElevenLabs, OpenAI Realtime-style APIs | Platform-native streaming. It is fast and cheap, which suits running on every commit. |
-| `local` | Unit-style tests of the agent's pipeline | Feed audio files in and capture audio out. No network. |
+**Main transport: Twilio.** VoiceTest places an outbound call and connects it to
+bidirectional Media Streams (a WebSocket carrying 8 kHz μ-law audio). This is closest to
+production, because the call goes through the real carrier path, codec and jitter. Pipecat
+supports it out of the box.
 
-Every adapter implements the same interface:
+- **Requires a paid Twilio account.** On trial accounts the person being called hears a notice
+  and must press a key before the call connects. A voice agent won't press it. Trial accounts
+  can also only call verified numbers.
+- **Requires a public URL** for the media WebSocket. Use ngrok locally; in CI, use a tunnel or
+  a small deployed relay.
+- **Non-US numbers** can require identity paperwork that takes days to approve. Plan for it.
 
-```python
-class Transport(Protocol):
-    async def connect(self, target: str, opts: dict) -> None
-    async def send_audio(self, pcm16: bytes) -> None        # caller → agent
-    def audio_in(self) -> AsyncIterator[AudioFrame]        # agent → caller
-    async def send_dtmf(self, digits: str) -> None
-    async def hangup(self) -> None
-    events: AsyncIterator[CallEvent]                       # ringing, answered, transferred, ended
-```
+**Later:** SIP (agents behind a PBX or SIP trunk), WebRTC/LiveKit, and platform WebSockets
+(Vapi, Retell and similar). These suit fast checks on every commit, with PSTN kept for the
+real UAT runs.
 
-The test writer chooses where the call goes, and the rest of the system works the same way
-for every transport.
+All transports share one interface: `connect`, `send_audio`, `audio_in`, `send_dtmf`,
+`hangup` and `events`.
 
-### 2.2 Caller agent (the simulated customer)
+### 2.2 Caller agent
 
-The caller agent runs a streaming loop: **VAD → STT → LLM → TTS**.
+The caller agent is built on **Pipecat**:
 
-- **STT:** streaming, for example Deepgram, AssemblyAI or Whisper-streaming. It produces the
-  transcript of what the agent said.
-- **LLM:** for example Claude. Its prompt contains the persona, the goal, the facts the caller
-  knows (name, order number, date of birth) and rules such as "stay in character" and "never
-  volunteer information unless asked".
-- **TTS:** for example ElevenLabs, Cartesia or Azure. The voice, accent, speed and emotion
-  come from the persona.
-- **Turn-taking:** VAD plus endpointing on the agent's audio decides when the agent has
-  finished. The caller can also **barge in** on purpose to test how the agent handles
-  interruptions.
+- **Hearing:** Silero VAD and Pipecat smart-turn decide when the agent has finished speaking.
+  Deepgram provides the live STT.
+- **Brain:** a fast Claude model with the persona, the goal, the facts the caller knows and
+  strict rules:
+  - Stay in character.
+  - Never volunteer information the agent did not ask for.
+  - Never help the agent.
+- **Mouth:** Cartesia (fastest) or ElevenLabs (most natural voices). This is configurable per
+  persona.
+- **Tools the LLM can call:**
+  - `end_call(reason)`: hang up when the goal is reached or the caller gives up.
+  - `press_keys(digits)`: send DTMF tones.
+  - `wait(seconds)`: stay silent for a while, for example while on hold.
 
-The caller agent has three modes:
+**Modes**
 
-1. **Scripted.** It plays fixed utterances in order, either TTS or pre-recorded WAVs. The
-   result is deterministic and works well for regression tests.
-2. **Goal-driven.** The LLM improvises toward a goal, which shows how the agent behaves in
-   realistic, varied conversations.
-3. **Hybrid.** Scripted checkpoints ("must say X at turn 3") with improvisation in between.
+- **Hybrid (the default):** fixed checkpoints ("at turn 3, say the order number") with
+  improvisation in between. Purely scripted lines break as soon as an LLM agent asks something
+  unexpected.
+- **Scripted:** fixed lines in order. Use it for strict regression tests of a fixed flow, such
+  as an IVR.
+- **Goal-driven:** the caller improvises completely toward the goal. Use it for exploratory
+  tests.
 
-**Perturbations** stress the agent: background noise (café, car, street), packet loss and
-codec degradation, accents, a fast or slow speaking rate, long silences, mumbling, a caller
-who changes their mind, off-topic questions, prompt-injection attempts ("ignore your
-instructions and…"), DTMF input and talking over the agent.
+**Interruptions**
 
-**Built-in stop conditions:** the agent hangs up, the goal is reached, the turn or time limit
-is hit, a loop is detected (the agent repeats itself N times), or there is dead air for more
-than N seconds.
+- **Interrupting the agent on purpose.** The scenario sets the timing, for example "1.2 s
+  after the agent starts speaking". VoiceTest measures how fast the agent stops and whether it
+  understood.
+- **Being interrupted by the agent.** The caller keeps listening while it speaks. When the
+  agent talks over it, the caller cancels its TTS, flushes the queued audio, tells the LLM
+  what was actually heard, and lets the persona decide whether to yield.
+- **No accidental interruptions.** The caller waits for a conservative end of turn (about
+  700 ms of silence plus the smart-turn check). Accidental interruptions caused by our own
+  endpointing would be false failures.
 
-### 2.3 Recorder
+**Stop conditions:** `end_call` is called, the agent hangs up, the time or turn limit is hit,
+the agent repeats itself N times, there is dead air for more than N seconds, or the caller
+has been on hold longer than the scenario's `max_hold_s`.
 
-The recorder writes the following files:
+### 2.3 Recorder and timing (getting the latency right)
 
-- `call.wav`: stereo, with the caller on the left channel and the agent on the right.
-- `events.jsonl`: every frame boundary, VAD start and stop, STT partial and final result,
-  TTS start, DTMF event and call event, each with a monotonic timestamp.
-- `transcript.json`: turns with speaker, text, start and end time, and interruption flags.
-
-The agent channel is also transcribed **after the call** with a higher-accuracy batch STT
-model, so that the evaluators do not inherit streaming errors.
+- **Pace outgoing audio in real-time 20 ms frames.** Do not push TTS output as fast as it
+  arrives: Twilio buffers it, and the "caller stopped speaking" timestamp would be too early.
+  That would make every agent look slower than it is.
+- **Use Twilio `mark` messages** to learn when our audio actually finished playing. Every
+  timing is measured from those marks and from the arrival times of incoming frames, on one
+  monotonic clock.
+- **Define agent latency** as the time from the caller's last audio played to the agent's
+  first audio received. Our own STT/LLM/TTS delay is not part of that interval. The phone
+  network's delay in both directions is included; that is roughly what real callers
+  experience, and the report says so.
+- **Cross-check with Twilio's dual-channel call recording**, and show any drift.
+- **Outputs:** `call.wav` (stereo, caller on the left, agent on the right), `events.jsonl` and
+  `transcript.json`. The agent's channel is transcribed again with Deepgram batch after the
+  call, so live STT errors don't count as agent failures.
+- **Watch for noisy agent audio.** Hold music, "one moment please" fillers and ambient noise
+  in the agent's audio are labelled separately, so the VAD doesn't treat them as speech.
 
 ### 2.4 Evaluators
 
-| Type | Examples | How |
-|---|---|---|
-| **Latency / timing** | Response latency (caller stops speaking → agent's first audio) at p50, p95 and max; time to first greeting; dead-air gaps; total duration | Measured from the recorder's clock |
-| **Conversational dynamics** | Talk-over %, how fast the agent stops when interrupted (barge-in recovery), number of turns, repeated responses | Uses VAD overlap on the two channels |
-| **Deterministic rules** | `must_say` / `must_not_say` (regex or semantic), the agent asked for the order number before acting, transferred to the queue, hung up properly, sent the right DTMF | Checks on the transcript and events |
-| **LLM judge** | Goal achieved? Policy followed? Hallucinated facts? Tone and empathy? Verified identity correctly? | A rubric-based prompt over the transcript, returning JSON with a score and a reason for each criterion |
-| **Side effects** | An appointment exists in the calendar, a ticket was created, an SMS was sent | A user-supplied HTTP/SQL check or a webhook sink run after the call |
-| **Audio quality** (optional) | MOS estimate, clipping, volume, TTS mispronunciations of names and numbers | Model-based analysis of the agent's channel |
+| Type | Examples |
+|---|---|
+| **Timing** | Response latency at p50, p95 and max; time to the first greeting; longest dead air; total duration; how fast the agent stops when interrupted |
+| **Rules** | `must_say` / `must_not_say`, order of required steps ("verified DOB before changing the booking"), transferred to the right queue, ended the call politely |
+| **AI judge** | Strongest Claude model, run after the call. Every criterion is **pass/fail** and needs an **evidence quote from the transcript**, which makes it auditable for sign-off. The judge sees the transcript plus the timing events. |
+| **Backend results** | HTTP or SQL checks against the UAT backend: the appointment was moved, a ticket was created, an SMS was sent. This is the strongest signal. |
 
-### 2.5 Runner and reporting
+### 2.5 Test data hooks
 
-- **Trials:** voice is non-deterministic, so each scenario runs N times and passes if the pass
-  rate is at least the configured threshold (for example `trials: 5, pass_rate: 0.8`).
-  Pass-rate trends over time are tracked.
-- **Concurrency:** calls run in parallel, up to the provider's rate limits. The same mechanism
-  supports a load mode ("50 simultaneous callers").
-- **Outputs:** JUnit XML for CI, JSON for machine-readable results, and an HTML report with an
-  audio player, a transcript synchronized to the waveform, metric charts and the judge's
-  reasoning.
-- **Baselines:** results are compared with the last green run so that regressions show up,
-  for example "p95 latency went from 900 ms to 1400 ms".
+UAT agents talk to UAT backends, so a test needs known data before the call and a clean
+state after it:
+
+```yaml
+setup:
+  - http: POST {{env.api}}/test/customers
+    body: { dob: "1985-03-12", appointment: "Tuesday 10:00" }
+    save: { customer_id: "$.id" }
+teardown:
+  - http: DELETE {{env.api}}/test/customers/{{customer_id}}
+```
+
+Saved values (`{{customer_id}}`) can be used in the caller's knowledge and in the checks.
+
+### 2.6 Linking a test call to the agent's logs
+
+When a test fails, the developer needs the agent's own logs for that call. VoiceTest records
+the Twilio call SID, the caller ID it used, and the start and end times. An optional
+`trace_lookup` hook fetches the agent's logs, LLM trace or tool calls for that call and puts
+them into the report next to the transcript. With SIP, VoiceTest also sends an
+`X-VoiceTest-Run-Id` header.
+
+### 2.7 Runner and reports
+
+- **Environments:** `voicetest.yaml` defines `uat`, `staging` and so on (number, API base URL,
+  secrets taken from environment variables). Select one with `--env uat`.
+- **Trials:** each scenario runs N times. It passes if the pass rate is at least the threshold.
+- **Concurrency:** calls run in parallel up to a limit, spread over a small pool of caller
+  numbers so carriers don't flag them as spam.
+- **Outputs:**
+  - **JUnit XML** for CI gating (exit code 1 on failure).
+  - **JSON** results.
+  - An **HTML acceptance report**: a summary per user story, then each call with audio, a
+    transcript synchronized to the waveform, timings, the judge's verdict with evidence, and
+    the backend checks.
+- **Requirement links:** scenarios carry `story: PROJ-123` tags, and the report groups results
+  by story for sign-off.
+- **Baselines:** results are compared with the last accepted run, for example "p95 latency
+  went from 900 ms to 1400 ms" or "pass rate fell from 100 % to 60 %".
+- **Cost:** call minutes and API usage are estimated per run and shown in the report.
 
 ---
 
-## 3. Writing tests
+## 3. Example scenario
 
 ```yaml
 # tests/reschedule_appointment.yaml
 name: Reschedule an existing appointment
-target:
-  transport: twilio
-  number: "+4930123456"
+story: APPT-42
+target: { env: uat }
+
+setup:
+  - http: POST {{env.api}}/test/customers
+    body: { dob: "1985-03-12", appointment: "Tuesday 10:00" }
+    save: { customer_id: "$.id" }
 
 caller:
-  mode: goal_driven
+  mode: hybrid
   persona:
-    name: Maria Schneider
-    voice: { provider: elevenlabs, voice: "female_de_calm", language: de-DE }
-    traits: "polite, a bit hesitant, gives information only when asked"
+    voice: { provider: cartesia, voice: "<voice-id>", language: en-US }
+    traits: "polite, a bit hesitant, answers only what is asked"
   knowledge:
     date_of_birth: "1985-03-12"
     current_appointment: "Tuesday 10:00"
   goal: "Move the Tuesday 10:00 appointment to Thursday afternoon."
+  checkpoints:
+    - when: agent_asks_identity
+      say: "My date of birth is March 12th, 1985."
   perturbations:
     background_noise: { type: cafe, snr_db: 15 }
-    interrupt_agent: { probability: 0.2 }
+    interrupt_agent: { at_turn: 2, after_ms: 1200, say: "Sorry, Thursday please" }
 
-limits: { max_duration_s: 180, max_turns: 20 }
+limits: { max_duration_s: 180, max_turns: 20, max_hold_s: 30 }
 trials: 5
 pass_rate: 0.8
 
@@ -175,67 +235,79 @@ assertions:
   - latency.p95_ms < 1500
   - latency.first_greeting_ms < 3000
   - dead_air.max_s < 4
+  - barge_in.stop_ms < 800
   - must_not_say: ["as an AI language model"]
-  - rule: agent verifies date of birth before changing the appointment
+  - order: [agent_verifies_dob, agent_changes_appointment]
   - judge:
-      rubric:
-        goal_achieved: "The appointment was moved to Thursday afternoon and confirmed back to the caller."
-        no_hallucination: "The agent did not invent availability or policies."
-        politeness: "The agent was polite and did not talk over the caller."
-      min_score: 4   # 1–5 scale
-  - side_effect:
-      http: GET https://api.example.com/appointments?dob=1985-03-12
-      expect: "$.items[0].day == 'Thursday'"
+      - "The agent confirmed the new Thursday time back to the caller."
+      - "The agent did not invent availability or policies."
+  - check:
+      http: GET {{env.api}}/test/customers/{{customer_id}}
+      expect: "$.appointment.day == 'Thursday'"
+
+teardown:
+  - http: DELETE {{env.api}}/test/customers/{{customer_id}}
 ```
 
-Test suites can share personas and the target configuration through `voicetest.yaml`. Scenario
-*generation* is also planned: give VoiceTest the agent's system prompt or FAQ, and the LLM
-proposes 50 diverse scenarios, including edge cases and adversarial ones.
+---
+
+## 4. Trusting the results (calibration)
+
+If the caller or the judge is wrong, every result is wrong. VoiceTest therefore ships with a
+**reference agent**: a small Pipecat agent with switchable faults.
+
+- **Fault modes:** `good`, `slow` (adds 2 s of latency), `rude`, `skips_identity_check`,
+  `hallucinates`, `ignores_interruptions`.
+- **Self-test:** `voicetest calibrate` runs the built-in suite against each mode. The harness
+  must pass `good` and catch every fault. This is also VoiceTest's own end-to-end test in CI.
+- **Judge agreement:** the developer labels about 20 of their own calls by hand, and VoiceTest
+  reports how often the judge agrees per criterion. Criteria with low agreement get rewritten
+  or replaced by rules.
+- **Leading the agent:** the judge also flags calls where the caller led the agent ("caller
+  volunteered information it wasn't asked for"). Such calls are marked invalid, not passed.
 
 ---
 
-## 4. The hard problems and how to handle them
+## 5. Safety, privacy and legal
 
-1. **Turn-taking for the caller bot.** Bad endpointing makes the caller interrupt the agent
-   by accident, and those false failures get blamed on the agent. Fix: a conservative default
-   endpoint (about 700 ms of silence plus a semantic "end of turn" check), and barge-ins only
-   on purpose.
-2. **Accurate latency.** Latency must be measured on the recorder's clock at the audio-frame
-   level, never from STT or LLM callbacks. Separately, report the latency the caller bot adds
-   itself, so the agent is not blamed for the test harness's delay.
-3. **A caller bot that is too helpful.** An LLM caller tends to "help" a weak agent by
-   volunteering information. The fix is strict persona rules, and the judge can also flag
-   cases where the caller led the agent.
-4. **Flakiness.** Use trials with pass rates, fixed seeds for perturbations and scripted mode
-   for strict regression tests. Store every recording so that each failure can be
-   reproduced.
-5. **IVRs, hold music and voicemail.** Add a "navigation" pre-phase (DTMF or spoken menu
-   choices) plus answering-machine detection so tests start at the right point.
-6. **Cost.** PSTN minutes plus STT, LLM and TTS add up. Use the `websocket`/`sip` transports
-   on every commit and real phone numbers nightly. Cache the TTS for scripted utterances.
-7. **Safety.** Only call numbers on an allowlist. Rate-limit calls. Never call real customers.
-   Redact PII in stored recordings.
+- **Allowlist:** VoiceTest only calls numbers listed in the environment config.
+- **Rate limits:** a maximum number of calls per minute.
+- **Retention:** recordings and transcripts stay on the developer's machine or storage. A
+  configurable retention period deletes them automatically. PII redaction in transcripts is
+  optional.
+- **Consent and data protection:** teams test their own UAT agents, but call recording and
+  data-protection rules (e.g. GDPR) still apply to stored audio, especially if real test
+  users' data is used. Use synthetic test data.
+- **Third-party agents:** testing an agent you don't own requires written permission from its
+  operator.
 
 ---
 
-## 5. Suggested stack
+## 6. Stack
 
-- **Python 3.12 + asyncio.** The VoiceTest core, the CLI (Typer) and a FastAPI WebSocket server
-  for Twilio Media Streams.
-- **Pipecat or LiveKit Agents as the caller agent's audio pipeline**, so that the VAD
-  (Silero), STT, LLM and TTS plumbing does not have to be built from scratch.
-- **Pluggable providers** for STT, TTS, LLM and the judge behind small interfaces.
-- **Storage:** a local `runs/<timestamp>/` folder, with an optional S3 upload.
-- **Report:** a static HTML page built from `results.json`.
+| Part | Choice |
+|---|---|
+| Language, CLI | Python 3.12, asyncio, Typer |
+| Audio pipeline | Pipecat (Silero VAD, smart-turn, Twilio serializer, interruption handling) |
+| Telephony | Twilio Programmable Voice + Media Streams (paid account) |
+| Live STT | Deepgram streaming |
+| Caller brain | A fast Claude model |
+| TTS | Cartesia (default) or ElevenLabs |
+| Post-call transcript | Deepgram batch |
+| Judge | The strongest Claude model |
+| Report | Static HTML generated from `results.json` |
+
+STT, TTS and the LLM sit behind small interfaces, so a provider can be swapped in for a single
+scenario.
 
 ---
 
-## 6. Roadmap
+## 7. Roadmap (realistic: 4–6 weeks to something you'd trust in CI)
 
 | Phase | Scope |
 |---|---|
-| **MVP** | Twilio adapter, scripted and goal-driven caller, stereo recording, latency metrics, LLM judge, CLI with JSON and JUnit output |
-| **v0.2** | Perturbations (noise, interrupts), trials and pass rates, HTML report, side-effect checks |
-| **v0.3** | SIP, WebSocket and LiveKit adapters; IVR navigation; voicemail detection |
-| **v0.4** | Scenario generation from the agent's prompt, baselines and regression diffing, load-testing mode |
-| **Later** | Dashboard, scheduled monitoring (synthetic calls every hour that alert when the agent breaks), multi-language suites |
+| **M1: first call** | Twilio outbound call, scripted caller, paced audio with marks, stereo recording, latency metrics, JSON output. Validated against the reference agent. |
+| **M2: real conversations** | Hybrid and goal-driven caller, `end_call` tool, turn detection, post-call transcript, AI judge (pass/fail with evidence), rules, JUnit output and exit codes |
+| **M3: acceptance testing** | Environments, setup and teardown hooks, backend checks, trials and pass rates, HTML acceptance report grouped by story, `voicetest calibrate` |
+| **M4: robustness** | Planned interruptions, background noise, DTMF and IVR navigation, hold handling, voicemail detection, `trace_lookup` hook |
+| **Later** | SIP, LiveKit and platform-WebSocket transports, baselines and regression diffs, scenario generation from the agent's prompt, scheduled monitoring calls in production, optional hosted dashboard |
