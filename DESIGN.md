@@ -32,6 +32,9 @@ voicetest run tests/ --env uat --trials 5
   test-data setup and teardown first-class features.
 - **Scenarios and reports must be readable by non-developers**, because UAT is a sign-off
   step.
+- **The first target platform is Salesforce Agentforce Voice** (see §2.7). The core stays
+  platform-neutral, but the Salesforce integrations (test data, record checks, session traces)
+  are built first.
 
 ---
 
@@ -177,7 +180,83 @@ the Twilio call SID, the caller ID it used, and the start and end times. An opti
 them into the report next to the transcript. With SIP, VoiceTest also sends an
 `X-VoiceTest-Run-Id` header.
 
-### 2.7 Runner and reports
+### 2.7 Agentforce Voice integration
+
+**How VoiceTest relates to Salesforce's own testing tools.** Agentforce Testing Center and
+`sf agent test` already simulate conversations, including voice in English. They test the
+agent's *logic*: topics, actions and answers. They do not test the **real phone path** that
+customers use. VoiceTest is the complement for UAT:
+
+| | Testing Center / `sf agent test` | VoiceTest |
+|---|---|---|
+| Channel | Simulated inside Salesforce | A real call to the agent's phone number |
+| Measures | Topic and action choice, answer quality | All of that, plus real latency, barge-in, noise, DTMF, hold and transfers |
+| Languages | Simulated voice is English only (per third-party reports) | Any language the STT and TTS support |
+| Best use | On every change to the agent | UAT sign-off before release; nightly runs against UAT |
+
+**Transport.** An Agentforce Voice agent is reached through a phone number. The number is
+either bought in Agentforce Voice Setup → Voice Channels and routed through an Omni-Channel
+flow, or it comes from partner telephony (Amazon Connect, Vonage, Five9 and others).
+Agentforce Voice doesn't expose a public audio-streaming API we could connect to directly, so
+**the Twilio phone-call transport is the main path.** Direct SIP-trunk access reportedly
+arrived in Summer '26; verify it, and if it exists, use it as a later transport to avoid
+phone-network costs. Partner SIP integration needs Salesforce partner verification, so it is
+out of scope.
+
+**Caller ID matters.** Agentforce flows often identify the customer by the calling number. The
+setup hook therefore creates the test Contact with **the phone number VoiceTest calls from**.
+With a pool of caller numbers, each concurrent call gets its own number and its own Contact.
+
+**Salesforce hooks.** Salesforce is a first-class hook type. It authenticates through an `sf`
+CLI org alias (`--target-org uat`), so no separate credentials are needed:
+
+```yaml
+setup:
+  - salesforce.create: Contact
+    values: { FirstName: Maria, LastName: Test, Phone: "{{caller.number}}", Birthdate: 1985-03-12 }
+    save: { contact_id: Id }
+  - salesforce.create: ServiceAppointment
+    values: { ParentRecordId: "{{contact_id}}", SchedStartTime: "{{next.tuesday}}T10:00:00" }
+assertions:
+  - salesforce.soql: >
+      SELECT SchedStartTime FROM ServiceAppointment WHERE ParentRecordId = '{{contact_id}}'
+    expect: "weekday(SchedStartTime) == 'Thursday'"
+  - salesforce.soql: >
+      SELECT Id FROM Case WHERE ContactId = '{{contact_id}}' AND CreatedDate = TODAY
+    expect: "count == 0"   # no unwanted case was created
+teardown:
+  - salesforce.delete: { contact_id }   # cascades to child records where possible
+```
+
+**Session traces in the report.** After the call, VoiceTest finds the **VoiceCall** record by
+the caller number and time window. It then pulls the matching **Agentforce Session Tracing**
+data: the transcript as Salesforce heard it, topic and action calls, planner steps and errors.
+Voice sessions link through `RelatedVoiceCallId`. This needs Data Cloud, and the Session Trace
+API is still beta, so the feature is optional and fails softly when the data is unavailable.
+
+The payoff for the developer: a failure shows **what the caller said, what Salesforce's STT
+heard, which topic or action ran, and what the agent answered**, side by side. That answers
+the common question of whether a failure came from speech recognition, routing or the agent's
+logic.
+
+**Escalation tests.** Many Agentforce Voice flows hand the call to a human through
+Omni-Channel. The assertion `escalated: { queue: "Billing" }` checks for the transfer in the
+call audio (ringing or hold music) and in the VoiceCall or AgentWork records. In UAT the
+target queue should be a test queue with no staffed agents.
+
+**Optional bridge to `sf agent test`.** VoiceTest can import an existing `sf agent test` YAML
+spec and run its conversations as phone calls, so teams reuse the scenarios they already have.
+
+**Still to verify in an actual org** (salesforce.com docs weren't reachable from this
+session):
+- Can a phone number be bought and routed in a **sandbox**, or only in production?
+- How much do test calls draw on the org's voice credits?
+- Which VoiceCall and Session Tracing fields hold the STT transcript, and how quickly do they
+  appear after a call?
+- Does Agentforce Voice accept DTMF, and how does it handle barge-in?
+- Is direct SIP-trunk access available?
+
+### 2.8 Runner and reports
 
 - **Environments:** `voicetest.yaml` defines `uat`, `staging` and so on (number, API base URL,
   secrets taken from environment variables). Select one with `--env uat`.
@@ -308,6 +387,6 @@ scenario.
 |---|---|
 | **M1: first call** | Twilio outbound call, scripted caller, paced audio with marks, stereo recording, latency metrics, JSON output. Validated against the reference agent. |
 | **M2: real conversations** | Hybrid and goal-driven caller, `end_call` tool, turn detection, post-call transcript, AI judge (pass/fail with evidence), rules, JUnit output and exit codes |
-| **M3: acceptance testing** | Environments, setup and teardown hooks, backend checks, trials and pass rates, HTML acceptance report grouped by story, `voicetest calibrate` |
-| **M4: robustness** | Planned interruptions, background noise, DTMF and IVR navigation, hold handling, voicemail detection, `trace_lookup` hook |
+| **M3: acceptance testing** | Environments, **Salesforce hooks** (sf org alias, create/delete records, SOQL checks), HTTP hooks, caller-number pool tied to test Contacts, trials and pass rates, HTML acceptance report grouped by story, `voicetest calibrate` |
+| **M4: robustness and Agentforce depth** | Planned interruptions, background noise, DTMF, hold handling, escalation assertions, **VoiceCall and Session Tracing lookup** in the report, import of `sf agent test` specs |
 | **Later** | SIP, LiveKit and platform-WebSocket transports, baselines and regression diffs, scenario generation from the agent's prompt, scheduled monitoring calls in production, optional hosted dashboard |
